@@ -2,6 +2,7 @@ import os
 import sys
 import argparse
 import yaml
+import re
 import requests
 import json
 from pprint import pprint
@@ -52,15 +53,15 @@ Execute different tasks by passing an -a|--action parameter to this module.',
         config.load_incluster_config()
     except config.ConfigException:
         config.load_kube_config()
-
-    # test that config loaded properly and there are some contexts available:
-    contexts, active_context = config.list_kube_config_contexts()
-    if not contexts:
-        print("Cannot find any context in kube-config file.")
-        return
-    contexts = [context['name'] for context in contexts]
-    print(contexts)
-
+        # test that config loaded properly and there are some contexts available
+        # (will only work with a KUBECONFIG config file - in other words outside
+        # of a cluster):
+        contexts, active_context = config.list_kube_config_contexts()
+        if not contexts:
+            print("Cannot find any context in kube-config file.")
+            return
+        contexts = [context['name'] for context in contexts]
+        print(contexts)
 
     core_api = shared_client('CoreV1Api')
     extensions_v1beta1_api = shared_client('ExtensionsV1beta1Api')
@@ -81,7 +82,7 @@ Execute different tasks by passing an -a|--action parameter to this module.',
         }
         configmap = create_configmap(core_api, "{}-{}".format("content", APPNAME), APPNAME, content)
         if configmap:
-            print("Configmap {name} created:".format(name=configmap.metadata.name))
+            print("Configmap {name} created in namespace: {namespace}".format(name=configmap.metadata.name, namespace=configmap.metadata.namespace))
             #print(configmap)
         else:
             print("Something went wrong creating configmap 'content'")
@@ -93,7 +94,7 @@ Execute different tasks by passing an -a|--action parameter to this module.',
         }
         configmap = create_configmap(core_api, "{}-{}".format("images", APPNAME), APPNAME, content)
         if configmap:
-            print("Configmap {name} created:".format(name=configmap.metadata.name))
+            print("Configmap {name} created in namespace: {namespace}".format(name=configmap.metadata.name, namespace=configmap.metadata.namespace))
             #print(configmap)
         else:
             print("Something went wrong creating configmap 'images'")
@@ -118,31 +119,61 @@ Execute different tasks by passing an -a|--action parameter to this module.',
         '''
 
     elif args.action == "update_setup_configmap":
-        service_name = "{}-erddap-service-{}".format(RELEASENAME, APPNAME)
+        service_name = "{}-{}-erddap-service".format(RELEASENAME, APPNAME)
+
+        # testing/debug only:
         #service_name = "erddap-service"
+        #service_name = "dapperr-dapperr-erddap-service"
         #DOMAINNAME = "erddap.io"
 
         try:
-            api_service = core_api.read_namespaced_service(service_name, APPNAME, pretty=True, exact=True, export=True)
+            api_service = core_api.read_namespaced_service(service_name, APPNAME, pretty=True, exact=True, export=False)
+            # debug:
             pprint(api_service)
 
             #service = json.dumps(api.sanitize_for_serialization(api_service))
             service = api.sanitize_for_serialization(api_service)
+
+            # debug:
             print("\n\n {}".format(service))
+
             ip = service['spec']['clusterIP']
+            print("\nip: {}".format(ip))
+            base_url = ip
 
-            print("\n\nip: {}".format(ip))
+            # if there's a valid IP address for the LoadBalancer, use it:
+            try:
+                load_balancer_ip = service['status']['loadBalancer']['ingress'][0]['ip']
+                print("load_balancer_ip: {}".format(load_balancer_ip))
+                ip_pattern = re.compile("\d{1,3}.\d{1,3}.\d{1,3}.\d{1,3}")
+                if ip_pattern.match(load_balancer_ip):
+                    print("matched!")
+                    base_url = load_balancer_ip
+            except KeyError as e:
+                load_balancer_ip = None
 
-            base_url = DOMAINNAME if DOMAINNAME is not None else ip
+            # if there's a hostname available for the LoadBalancer, use it:
+            try:
+                load_balancer_hostname = service['status']['load_balancer']['ingress'][0]['hostname']
+                #load_balancer_hostname = service['status']['load_balancer']['ingress']
+                base_url = load_balancer_hostname
+            except KeyError as e:
+                load_balancer_hostname = None
+
+            print("load_balancer_ip: {}".format(load_balancer_ip))
+            print("load_balancer_hostname: {}".format(load_balancer_hostname))
+
+
+            # additionally, if there happened to be a DOMAINNAME env var passed, use that above all others:
+            if DOMAINNAME is not None:
+                base_url = DOMAINNAME
             print ("base_url: {}".format(base_url))
 
         except ApiException as e:
-            print("Exception when calling CoreV1Api->read_namespaced_service: %s\n" % e)
-
+            sys.exit("Exception when calling CoreV1Api->read_namespaced_service: %s\n" % e)
 
         try:
-            content_configmap = core_api.read_namespaced_config_map("{}-{}".format("content", APPNAME), APPNAME, pretty=True, exact=True, export=True)
-            #pprint(content_configmap)
+            content_configmap = core_api.read_namespaced_config_map("{}-{}".format("content", APPNAME), APPNAME, pretty=True, exact=True, export=False)
 
             setup = content_configmap.data['setup.xml']
             #pprint(setup)
@@ -151,35 +182,62 @@ Execute different tasks by passing an -a|--action parameter to this module.',
             tree = ET.fromstring(setup)
             #root = tree.getroot()
 
-            elem = tree.findall("baseUrl")
-            print(elem[0].text)
-            elem[0].text = "http://{}/".format(base_url)
-            print(elem[0].text)
-            print(ET.tostring(tree))
+            elem = tree.find("baseUrl")
+            print("baseUrl before: {}".format(elem.text))
+            elem.text = "http://{}".format(base_url)
+            print("baseUrl after: {}".format(elem.text))
+
+            elem = tree.find("bigParentDirectory")
+            print("bigParentDirectory before: {}".format(elem.text))
+            elem.text = "/erddapData/"
+            print("bigParentDirectory after: {}".format(elem.text))
+
+            # act on the other settings if provided as env vars:
+            tree.find("emailEverythingTo").text = os.environ.get("EMAILEVERYTHINGTO") if "EMAILEVERYTHINGTO" in os.environ else ""
+            tree.find("emailFromAddress").text = os.environ.get("EMAILFROMADDRESS") if "EMAILEVERYTHINGTO" in os.environ else ""
+            tree.find("emailUserName").text = os.environ.get("EMAILUSERNAME") if "EMAILUSERNAME" in os.environ else ""
+            tree.find("emailPassword").text = os.environ.get("EMAILPASSWORD") if "EMAILPASSWORD" in os.environ else ""
+            tree.find("emailProperties").text = os.environ.get("EMAILPROPERTIES") if "EMAILPROPERTIES" in os.environ else ""
+            tree.find("emailSmtpHost").text = os.environ.get("EMAILSMTPHOST") if "EMAILSMTPHOST" in os.environ else ""
+            tree.find("emailSmtpPort").text = os.environ.get("EMAILSMTPPORT") if "EMAILSMTPPORT" in os.environ else ""
+            tree.find("adminInstitution").text = os.environ.get("ADMININSTITUTION") if "ADMININSTITUTION" in os.environ else ""
+            tree.find("adminInstitutionUrl").text = os.environ.get("ADMININSTITUTIONURL") if "ADMININSTITUTIONURL" in os.environ else ""
+            tree.find("adminIndividualName").text = os.environ.get("ADMININDIVIDUALNAME") if "ADMININDIVIDUALNAME" in os.environ else ""
+            tree.find("adminPosition").text = os.environ.get("ADMINPOSITION") if "ADMINPOSITION" in os.environ else ""
+            tree.find("adminPhone").text = os.environ.get("ADMINPHONE") if "ADMINPHONE" in os.environ else ""
+            tree.find("adminAddress").text = os.environ.get("ADMINADDRESS") if "ADMINADDRESS" in os.environ else ""
+            tree.find("adminCity").text = os.environ.get("ADMINCITY") if "ADMINCITY" in os.environ else ""
+            tree.find("adminStateOrProvince").text = os.environ.get("ADMINSTATEORPROVINCE") if "ADMINSTATEORPROVINCE" in os.environ else ""
+            tree.find("adminPostalCode").text = os.environ.get("ADMINPOSTALCODE") if "ADMINPOSTALCODE" in os.environ else ""
+            tree.find("adminCountry").text = os.environ.get("ADMINCOUNTRY") if "ADMINCOUNTRY" in os.environ else ""
+            tree.find("adminEmail").text = os.environ.get("ADMINEMAIL") if "ADMINEMAIL" in os.environ else ""
+            tree.find("flagKeyKey").text = os.environ.get("FLAGKEYKEY") if "FLAGKEYKEY" in os.environ else ""
+
+            # tree.find("").text = os.environ.get("") if "" in os.environ else ""
+
+            # debug:
+            #print(ET.tostring(tree))
 
             content_configmap.data['setup.xml'] = ET.tostring(tree, encoding="unicode")
 
         except ApiException as e:
-            print("Exception when calling CoreV1Api->read_namespaced_config_map: %s\n" % e)
-
+            sys.exit("Exception when calling CoreV1Api->read_namespaced_config_map: %s\n" % e)
 
         try:
             api_response = core_api.replace_namespaced_config_map("{}-{}".format("content", APPNAME), APPNAME, content_configmap, pretty=True)
-            pprint(content_configmap)
+            # debug:
+            #pprint(content_configmap)
 
         except ApiException as e:
-            print("Exception when calling CoreV1Api->replace_namespaced_config_map: %s\n" % e)
+            sys.exit("Exception when calling CoreV1Api->replace_namespaced_config_map: %s\n" % e)
 
     elif args.action == "update_datasets_configmap":
-
         pass
-
-
 
     # Testing only:
     # Create a deployment object with client-python API. The deployment we
     # created is same as the `nginx-deployment.yaml` in the /examples folder.
-    deployment = create_deployment_object()
+    #deployment = create_deployment_object()
     #print(deployment)
     #create_deployment(extensions_v1beta1_api, deployment)
     #update_deployment(extensions_v1beta1_api, deployment)
@@ -205,7 +263,7 @@ def create_configmap(api_instance, name=None, namespace=None, content=None):
                 'apiVersion': 'v1',
                 'metadata': {
                     'name': name,
-                    'namespace': APPNAME
+                    'namespace': APPNAME,
                     'labels': {
                         'app': 'erddap',
                         'appName': APPNAME
@@ -223,7 +281,7 @@ def create_configmap(api_instance, name=None, namespace=None, content=None):
                 },
                 'metadata': {
                     'name': name,
-                    'namespace': APPNAME
+                    'namespace': APPNAME,
                     'labels': {
                         'app': 'erddap',
                         'appName': APPNAME
@@ -233,7 +291,7 @@ def create_configmap(api_instance, name=None, namespace=None, content=None):
 
         try:
             api_response = api_instance.create_namespaced_config_map(namespace, configmap, include_uninitialized=True, pretty=True)
-            print(api_response)
+            #print(api_response)
             return api_response
         except ApiException as e:
             print("Exception when calling CoreV1Api->create_namespaced_config_map: %s\n" % e)
